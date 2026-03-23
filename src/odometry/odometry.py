@@ -18,6 +18,8 @@ from .custom_incremental_pipeline import reconstruct
 
 import pycolmap
 from pycolmap import Database, Camera, Image, ListPoint2D, Rigid3d, Rotation3d, TwoViewGeometry, logging
+import sqlite3
+import time
 
 def quat(colmap_quat: np.ndarray) -> Quaternion:
     x, y, z, w = colmap_quat
@@ -150,6 +152,8 @@ class VisualOdometry:
         if self.out_dir.exists():
             shutil.rmtree(self.out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
+        
+        #self.log_file = open(self.out_dir / "log.txt", "w")
 
         self.images: List[str] = []
 
@@ -603,6 +607,59 @@ class VisualOdometry:
             print(f"Min solver error: {e}")
             self.log_data['current_frame']['status'] = False
             return [[image, None, None, None, None, None]]
+    
+    def clean_database(self, image_id: int):
+        database_path = self.database_path
+        self.db.close()
+        db_start = time.time()
+        #try:
+        # Connect to SQLite DB (create connection to the COLMAP DB file)
+        conn = sqlite3.connect(str(database_path))
+        cur = conn.cursor()
+        # Ensure foreign keys are enforced (if schema uses them)
+        cur.execute("PRAGMA foreign_keys = ON;")
+        # Remove keypoints and descriptors for the image
+        cur.execute("DELETE FROM keypoints WHERE image_id = ?;", (image_id,))
+        cur.execute("DELETE FROM descriptors WHERE image_id = ?;", (image_id,))
+        # Remove any two-view geometry entries that reference this image.
+        # COLMAP encodes pair_id as: pair_id = image_id1 + image_id2 * 2147483647
+        # Decode each pair_id and delete rows that include the image_id.
+        cur.execute("SELECT pair_id FROM two_view_geometries;")
+        pair_rows = cur.fetchall()
+        to_delete = []
+        for (pair_id,) in pair_rows:
+            try:
+                img1 = int(pair_id % 2147483647)
+                img2 = int(pair_id // 2147483647)
+            except Exception:
+                # if pair_id is not an integer for some reason, skip
+                continue
+            if img1 == image_id or img2 == image_id:
+                to_delete.append(pair_id)
+        if to_delete:
+            cur.executemany("DELETE FROM two_view_geometries WHERE pair_id = ?;", [(pid,) for pid in to_delete])
+        # Finally remove the image record itself
+        cur.execute("DELETE FROM images WHERE image_id = ?;", (image_id,))
+        conn.commit()
+        conn.close()
+        # mark controller DB as dirty if needed and log timing
+        self.db_dirty = True
+        db_time = time.time() - db_start
+        self._log_timing('database_operations_total', db_time)
+
+        self.db = Database(str(self.database_path))
+
+        #except Exception as e:
+        #    try:
+        #        conn.rollback()
+        #        conn.close()
+        #    except Exception:
+        #        pass
+        #    # minimal logging to stdout/file
+        #    if self.log:
+        #        print(f"[CSLAM] clean_database error for image_id={image_id}: {e}")
+        #    db_time = time.time() - db_start
+        #    self._log_timing('database_operations_total', db_time)
 
     def run(
         self, image: str,
@@ -871,7 +928,10 @@ class VisualOdometry:
 
         elif self.keyframe_count >= self.sliding_window:
             self.current_status = 'orientation'
+            #st = time.time()
             self._maybe_load_db()
+            #ed = time.time()
+            #self.log_file.write(f"Time to load DB: {ed - st:.2f} seconds\n")
 
             if self.config['mapping']['method'] == 'custom':
                 # Add new keyframes (entire rig)
@@ -911,6 +971,16 @@ class VisualOdometry:
                     reg_image_ids = reconstruction.reg_image_ids()
                     reconstruction.deregister_image(image_id=min(reg_image_ids))
                     self.log_data['reconstruction_stats']['sliding_window_operations'] += 1
+                    image_deregistered = self.keyframes_ids[min(reg_image_ids)]
+                    self.keypoints.pop(image_deregistered, None)
+                    # keep other caches consistent
+                    self.descriptors.pop(image_deregistered, None)
+                    self.lafs_cache.pop(image_deregistered, None)
+                    self.keyframes_names.pop(image_deregistered, None)
+                    self.keyframes_ids.pop(min(reg_image_ids), None)
+                    #if _ == 0:
+                    #    self.keyframes_master_ids.pop(min(reg_image_ids))
+                    self.clean_database(image_id=min(reg_image_ids))
                     #print(self.keypoints.keys());quit()
 
                 self.log_data['reconstruction_stats']['successful_reconstructions'] += 1
