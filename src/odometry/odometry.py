@@ -243,6 +243,9 @@ class VisualOdometry:
         self.PnP_options = pycolmap.AbsolutePoseEstimationOptions()
         self.PnP_options.ransac.max_error = 2.0
 
+        self.epipolar_verification_options = pycolmap.TwoViewGeometryOptions()
+        self.epipolar_verification_options.ransac.max_error = 1.5
+
         # Precompute image size arrays (avoid realloc in matcher)
         self.hw_np = np.array([self.height, self.width])
 
@@ -365,6 +368,18 @@ class VisualOdometry:
                 dists, idxs = self.lg_matcher(descs1, descs2, lafs1, lafs2, hw1=self.hw_np, hw2=self.hw_np)
             elif self.matcher == "smnn":
                 dists, idxs = match_smnn(descs1, descs2, th=self.ratio_threshold)
+
+            two_view_geom = pycolmap.estimate_two_view_geometry(
+                pycolmap.Camera(self.camera_config[img1.split("/")[0]]),
+                kps1[:, :2].detach().cpu().numpy(),
+                pycolmap.Camera(self.camera_config[img2.split("/")[0]]),
+                kps2[:, :2].detach().cpu().numpy(),
+                idxs[:, :2].detach().cpu().numpy(),
+                self.epipolar_verification_options,
+                )
+
+            idxs = two_view_geom.inlier_matches
+
             matches[(img1, img2)] = idxs  # keep on device
             total_matches += len(idxs)
         
@@ -742,7 +757,7 @@ class VisualOdometry:
                 matches = self.match_features(self.keypoints, self.descriptors, pairs)
                 for pair in pairs:
                     kfrm1, kfrm2 = pair
-                    inlier_matches = matches[pair].detach().cpu().numpy()
+                    inlier_matches = matches[pair]
                     self.db.write_two_view_geometry(
                         self.keyframes_names[kfrm1],
                         self.keyframes_names[kfrm2],
@@ -799,7 +814,7 @@ class VisualOdometry:
         self.log_data['current_frame']['is_keyframe'] = True
         self.log_data['keyframe_count'] += 1
         
-        inlier_matches = matches[(self.keyframe_name, frame_name)].detach().cpu().numpy()
+        inlier_matches = matches[(self.keyframe_name, frame_name)]
         self.keyframe_count += 1
         self.keyframe_id += 1 * self.n_cameras
         self.keyframe_name = frame_name
@@ -838,7 +853,7 @@ class VisualOdometry:
             matches = self.match_features(self.keypoints, self.descriptors, pairs)
             for pair in pairs:
                 kfrm1, kfrm2 = pair
-                inlier_matches = matches[pair].detach().cpu().numpy()
+                inlier_matches = matches[pair]
                 self.db.write_two_view_geometry(
                     self.keyframes_names[kfrm1],
                     self.keyframes_names[kfrm2],
