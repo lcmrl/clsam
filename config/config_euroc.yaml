@@ -1,6 +1,6 @@
 general:
     test: False
-    log: False
+    log: True
     frames_range: [10, 3600] # -1 means all frames, 50 for tests
     save_keyframes: False
     min_solver: False
